@@ -11,11 +11,11 @@ use std::time::Duration;
 use crate::workspace_command::WorkspaceCommand;
 use crate::workspace_command::WorkspaceCommandExecutor;
 use crate::workspace_command::WorkspaceCommandOutput;
-use codex_git_utils::is_canonical_fsmonitor_true;
-use codex_git_utils::supports_builtin_fsmonitor;
+use codex_git_utils::FsmonitorOverride;
+use codex_git_utils::FsmonitorProbeRunner;
+use codex_git_utils::detect_fsmonitor_override;
 
 const DIFF_COMMAND_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
-const DISABLE_FSMONITOR_CONFIG: &str = "core.fsmonitor=false";
 const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
     "core.hooksPath=NUL"
 } else {
@@ -23,10 +23,30 @@ const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
 };
 const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|process)$";
 
-#[derive(Clone, Copy)]
-enum FsmonitorOverride {
-    Disabled,
-    BuiltIn,
+// `/diff` may execute Git through a remote workspace, so git-utils owns the
+// probe policy while this adapter keeps command execution in the TUI layer.
+// WorkspaceCommand bounds each call; `/diff` has no aggregate command deadline.
+struct WorkspaceFsmonitorProbeRunner<'a> {
+    runner: &'a dyn WorkspaceCommandExecutor,
+    cwd: &'a Path,
+}
+
+impl FsmonitorProbeRunner for WorkspaceFsmonitorProbeRunner<'_> {
+    async fn run_probe(
+        &mut self,
+        args: &'static [&'static str],
+        env: &'static [(&'static str, &'static str)],
+    ) -> Option<Vec<u8>> {
+        let argv = ["git"].into_iter().chain(args.iter().copied());
+        let mut command = WorkspaceCommand::new(argv).cwd(self.cwd.to_path_buf());
+        for &(key, value) in env {
+            command = command.env(key, value);
+        }
+        match self.runner.run(command).await {
+            Ok(output) if output.success() => Some(output.stdout.into_bytes()),
+            _ => None,
+        }
+    }
 }
 
 /// Return value of [`get_git_diff`].
@@ -42,26 +62,9 @@ pub(crate) async fn get_git_diff(
         return Ok((false, String::new()));
     }
 
-    let config_output = run_git_probe(
-        runner,
-        cwd,
-        &["config", "--null", "--get", "core.fsmonitor"],
-    )
-    .await;
-    let fsmonitor = if config_output.is_ok_and(|output| {
-        output.success() && is_canonical_fsmonitor_true(output.stdout.as_bytes())
-    }) {
-        match run_git_probe(runner, cwd, &["version", "--build-options"]).await {
-            Ok(output)
-                if output.success() && supports_builtin_fsmonitor(output.stdout.as_bytes()) =>
-            {
-                FsmonitorOverride::BuiltIn
-            }
-            _ => FsmonitorOverride::Disabled,
-        }
-    } else {
-        FsmonitorOverride::Disabled
-    };
+    // Probe once per `/diff` and reuse the result for both worktree reads.
+    let mut probe_runner = WorkspaceFsmonitorProbeRunner { runner, cwd };
+    let fsmonitor = detect_fsmonitor_override(&mut probe_runner).await;
 
     // Keep `/diff` informational: repository configuration must not select executable diff helpers.
     let diff_config_overrides = diff_filter_config_overrides(runner, cwd).await?;
@@ -115,6 +118,8 @@ pub(crate) async fn get_git_diff(
             null_path,
             file,
         ];
+        // `--no-index` compares paths directly and cannot benefit from
+        // fsmonitor's index and worktree state.
         let diff = run_git_capture_diff(
             runner,
             cwd,
@@ -229,25 +234,6 @@ async fn inside_git_repo(
     Ok(output.success())
 }
 
-async fn run_git_probe(
-    runner: &dyn WorkspaceCommandExecutor,
-    cwd: &Path,
-    args: &[&str],
-) -> Result<WorkspaceCommandOutput, String> {
-    let mut argv = Vec::with_capacity(args.len() + 3);
-    argv.extend([
-        "git".to_string(),
-        "-c".to_string(),
-        DISABLE_HOOKS_CONFIG.to_string(),
-    ]);
-    argv.extend(args.iter().map(|arg| (*arg).to_string()));
-    let command = WorkspaceCommand::new(argv)
-        .cwd(cwd.to_path_buf())
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C");
-    runner.run(command).await.map_err(|err| err.to_string())
-}
-
 async fn run_git_command(
     runner: &dyn WorkspaceCommandExecutor,
     cwd: &Path,
@@ -255,21 +241,18 @@ async fn run_git_command(
     config_overrides: &[(String, String)],
     args: &[&str],
 ) -> Result<WorkspaceCommandOutput, String> {
-    let fsmonitor_config = match fsmonitor {
-        FsmonitorOverride::Disabled => DISABLE_FSMONITOR_CONFIG,
-        FsmonitorOverride::BuiltIn => "core.fsmonitor=true",
-    };
-    let mut argv = Vec::with_capacity(args.len() + 5);
-    argv.push("git".to_string());
-    argv.extend([
-        "-c".to_string(),
-        fsmonitor_config.to_string(),
-        "-c".to_string(),
-        DISABLE_HOOKS_CONFIG.to_string(),
-    ]);
-    argv.extend(args.iter().map(|arg| (*arg).to_string()));
+    let argv = [
+        "git",
+        "-c",
+        fsmonitor.git_config_arg(),
+        "-c",
+        DISABLE_HOOKS_CONFIG,
+    ]
+    .into_iter()
+    .chain(args.iter().copied());
     let mut command = WorkspaceCommand::new(argv)
         .cwd(cwd.to_path_buf())
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .timeout(DIFF_COMMAND_TIMEOUT)
         .disable_output_cap();
     if !config_overrides.is_empty() {
@@ -498,103 +481,7 @@ mod tests {
         let result = get_git_diff(&runner, &cwd).await;
 
         assert_eq!(result, Ok((true, "tracked\nuntracked\n".to_string())));
-        assert_commands(
-            &runner.commands(),
-            &[
-                git_command(&["rev-parse", "--is-inside-work-tree"]),
-                git_probe_command(&["config", "--null", "--get", "core.fsmonitor"]),
-                git_probe_command(&["version", "--build-options"]),
-                git_command(&[
-                    "config",
-                    "--null",
-                    "--name-only",
-                    "--get-regexp",
-                    EXECUTABLE_FILTER_CONFIG_PATTERN,
-                ]),
-                git_command_with_fsmonitor(
-                    FsmonitorOverride::BuiltIn,
-                    &[
-                        "diff",
-                        "--no-textconv",
-                        "--no-ext-diff",
-                        "--submodule=short",
-                        "--ignore-submodules=dirty",
-                        "--color",
-                    ],
-                ),
-                git_command_with_fsmonitor(
-                    FsmonitorOverride::BuiltIn,
-                    &["ls-files", "--others", "--exclude-standard"],
-                ),
-                git_command(&[
-                    "diff",
-                    "--no-textconv",
-                    "--no-ext-diff",
-                    "--submodule=short",
-                    "--ignore-submodules=dirty",
-                    "--color",
-                    "--no-index",
-                    "--",
-                    null_device(),
-                    "new.txt",
-                ]),
-            ],
-            &cwd,
-        );
-    }
-
-    #[tokio::test]
-    async fn get_git_diff_disables_fsmonitor_without_builtin_daemon_support() {
-        let cwd = PathBuf::from("/workspace");
-        let runner = FakeRunner::new(vec![
-            response(
-                git_command(&["rev-parse", "--is-inside-work-tree"]),
-                /*exit_code*/ 0,
-                "true\n",
-            ),
-            response(
-                git_probe_command(&["config", "--null", "--get", "core.fsmonitor"]),
-                /*exit_code*/ 0,
-                "true\0",
-            ),
-            response(
-                git_probe_command(&["version", "--build-options"]),
-                /*exit_code*/ 0,
-                "",
-            ),
-            response(
-                git_command(&[
-                    "config",
-                    "--null",
-                    "--name-only",
-                    "--get-regexp",
-                    EXECUTABLE_FILTER_CONFIG_PATTERN,
-                ]),
-                /*exit_code*/ 1,
-                "",
-            ),
-            response(
-                git_command(&[
-                    "diff",
-                    "--no-textconv",
-                    "--no-ext-diff",
-                    "--submodule=short",
-                    "--ignore-submodules=dirty",
-                    "--color",
-                ]),
-                /*exit_code*/ 0,
-                "",
-            ),
-            response(
-                git_command(&["ls-files", "--others", "--exclude-standard"]),
-                /*exit_code*/ 0,
-                "",
-            ),
-        ]);
-
-        let result = get_git_diff(&runner, &cwd).await;
-
-        assert_eq!(result, Ok((true, String::new())));
+        assert_command_metadata(&runner.commands(), &cwd);
     }
 
     #[tokio::test]
@@ -838,33 +725,30 @@ mod tests {
     }
 
     fn git_command_with_fsmonitor(fsmonitor: FsmonitorOverride, args: &[&str]) -> Vec<String> {
-        let fsmonitor_config = match fsmonitor {
-            FsmonitorOverride::Disabled => DISABLE_FSMONITOR_CONFIG,
-            FsmonitorOverride::BuiltIn => "core.fsmonitor=true",
-        };
-        let mut argv = vec![
-            "git".to_string(),
-            "-c".to_string(),
-            fsmonitor_config.to_string(),
-            "-c".to_string(),
-            DISABLE_HOOKS_CONFIG.to_string(),
-        ];
-        argv.extend(args.iter().map(|arg| (*arg).to_string()));
-        argv
+        [
+            "git",
+            "-c",
+            fsmonitor.git_config_arg(),
+            "-c",
+            DISABLE_HOOKS_CONFIG,
+        ]
+        .into_iter()
+        .chain(args.iter().copied())
+        .map(str::to_string)
+        .collect()
     }
 
     fn git_probe_command(args: &[&str]) -> Vec<String> {
-        let mut argv = vec![
-            "git".to_string(),
-            "-c".to_string(),
-            DISABLE_HOOKS_CONFIG.to_string(),
-        ];
-        argv.extend(args.iter().map(|arg| (*arg).to_string()));
-        argv
+        ["git"]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect()
     }
 
     fn filter_override_env(driver: &str) -> HashMap<String, Option<String>> {
         HashMap::from([
+            ("GIT_OPTIONAL_LOCKS".to_string(), Some("0".to_string())),
             ("GIT_CONFIG_COUNT".to_string(), Some("3".to_string())),
             (
                 "GIT_CONFIG_KEY_0".to_string(),
@@ -926,15 +810,32 @@ mod tests {
             .map(|command| command.argv.clone())
             .collect();
         assert_eq!(actual, expected);
+        assert_command_metadata(commands, cwd);
+    }
 
+    fn assert_command_metadata(commands: &[WorkspaceCommand], cwd: &Path) {
         for command in commands {
             assert_eq!(command.cwd.as_deref(), Some(cwd));
-            if command.argv.get(2).map(String::as_str) == Some(DISABLE_HOOKS_CONFIG) {
+            if command.timeout == Duration::from_secs(/*secs*/ 5) {
+                assert_eq!(
+                    command.env,
+                    HashMap::from([
+                        ("GIT_OPTIONAL_LOCKS".to_string(), Some("0".to_string())),
+                        ("LC_ALL".to_string(), Some("C".to_string())),
+                    ])
+                );
                 assert_eq!(command.timeout, Duration::from_secs(/*secs*/ 5));
                 assert_eq!(command.output_bytes_cap, 64 * 1024);
                 assert_eq!(command.disable_output_cap, false);
             } else {
                 assert_eq!(command.timeout, DIFF_COMMAND_TIMEOUT);
+                assert_eq!(
+                    command
+                        .env
+                        .get("GIT_OPTIONAL_LOCKS")
+                        .and_then(Option::as_deref),
+                    Some("0")
+                );
                 assert_eq!(command.disable_output_cap, true);
             }
         }
